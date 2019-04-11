@@ -79,6 +79,11 @@
         &.active {
             border-color: $argo-color-teal-6;
         }
+
+        &--load-balancer {
+            cursor: default;
+            background-color: $argo-color-teal-2;
+        }
     }
 
     &__filtered-indicator {
