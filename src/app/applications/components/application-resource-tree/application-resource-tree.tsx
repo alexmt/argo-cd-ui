@@ -10,6 +10,8 @@ import { ApplicationIngressLink } from '../application-ingress-link';
 import { ComparisonStatusIcon, getAppOverridesCount, HealthStatusIcon, ICON_CLASS_BY_KIND, isAppNode, nodeKey } from '../utils';
 import { NodeUpdateAnimation } from './node-update-animation';
 
+const color = require('color');
+
 require('./application-resource-tree.scss');
 
 export interface ResourceTreeNode extends models.ResourceNode {
@@ -43,6 +45,18 @@ const NODE_TYPES = {
     externalLoadBalancer: 'external_load_balancer',
     internalTraffic: 'internal_traffic',
 };
+
+const BASE_COLORS = [
+    '#0DADEA', // blue
+    '#95D58F', // green
+    '#F4C030', // orange
+    '#FF6262', // red
+    '#4B0082', // purple
+    '#964B00', // brown
+];
+
+// generate lots of colors with different darkness
+const TRAFFIC_COLORS = [0, 0.25, 0.4, 0.6].map((darken) => BASE_COLORS.map((item) => color(item).darken(darken).hex())).reduce((first, second) => first.concat(second), []);
 
 function getGraphSize(nodes: dagre.Node[]): { width: number, height: number} {
     let width = 0;
@@ -119,11 +133,13 @@ function renderTrafficNode(node: dagre.Node) {
     );
 }
 
-function renderLoadBalancerNode(node: dagre.Node & { label: string }) {
+function renderLoadBalancerNode(node: dagre.Node & { label: string, color: string }) {
     return (
-        <div className='application-resource-tree__node application-resource-tree__node--load-balancer' style={{left: node.x, top: node.y, width: node.width, height: node.height}}>
+        <div className='application-resource-tree__node application-resource-tree__node--load-balancer' style={{
+                left: node.x, top: node.y, width: node.width, height: node.height,
+        }}>
             <div className='application-resource-tree__node-kind-icon'>
-                <i title={node.kind} className={`icon fa fa-network-wired`} />
+                <i title={node.kind} className={`icon fa fa-network-wired`} style={{color: node.color}} />
             </div>
             <div className='application-resource-tree__node-content'>
                 <span className='application-resource-tree__node-title'>{node.label}</span>
@@ -253,37 +269,49 @@ export const ApplicationResourceTree = (props: ApplicationResourceTreeProps) => 
         roots = nodes.filter((node) => (node.parentRefs || []).length === 0).sort(compareNodes);
     }
 
-    function processNode(node: ResourceTreeNode, root: ResourceTreeNode) {
+    function processNode(node: ResourceTreeNode, root: ResourceTreeNode, colors?: string[]) {
         graph.setNode(nodeKey(node), {...node, width: NODE_WIDTH, height: NODE_HEIGHT, root});
         (childrenByParentKey.get(nodeKey(node)) || []).sort(compareNodes).forEach((child) => {
-            graph.setEdge(nodeKey(node), nodeKey(child));
-            processNode(child, root);
+            graph.setEdge(nodeKey(node), nodeKey(child), {colors});
+            processNode(child, root, colors);
         });
     }
 
-    roots.sort(compareNodes).forEach((node) => processNode(node, node));
-
     if (props.useNetworkingHierarchy) {
-        const externalRoots = roots.filter((root) => (root.networkingInfo.ingress || []).length > 0);
+        const externalRoots = roots.filter((root) => (root.networkingInfo.ingress || []).length > 0).sort(compareNodes);
+        const internalRoots = roots.filter((root) => (root.networkingInfo.ingress || []).length === 0).sort(compareNodes);
+        const colorsBySource = new Map<string, string>();
+        // sources are root internal services and external ingress/service IPs
+        const sources = Array.from(new Set(internalRoots.map((root) => nodeKey(root)).concat(
+            externalRoots.map((root) => root.networkingInfo.ingress.map((ingress) => ingress.hostname || ingress.ip)).reduce((first, second) => first.concat(second), []),
+        )));
+        // assign unique color to each traffic source
+        sources.forEach((key, i) => colorsBySource.set(key, TRAFFIC_COLORS[i % TRAFFIC_COLORS.length]));
 
         if (externalRoots.length > 0) {
             graph.setNode(EXTERNAL_TRAFFIC_NODE, { height: NODE_HEIGHT, width: 30, type: NODE_TYPES.externalTraffic });
-            externalRoots.forEach((root) => {
-                root.networkingInfo.ingress.forEach((ingress) => {
-                    const key = ingress.hostname || ingress.ip;
+            externalRoots.sort(compareNodes).forEach((root) => {
+                const loadBalancers = root.networkingInfo.ingress.map((ingress) => ingress.hostname || ingress.ip);
+                processNode(root, root, loadBalancers.map((lb) => colorsBySource.get(lb)));
+                loadBalancers.forEach((key) => {
                     const loadBalancerNodeKey = `${EXTERNAL_TRAFFIC_NODE}:${key}`;
-                    graph.setNode(loadBalancerNodeKey, { height: NODE_HEIGHT, width: NODE_WIDTH, type: NODE_TYPES.externalLoadBalancer, label: key });
-                    graph.setEdge(loadBalancerNodeKey, nodeKey(root));
-                    graph.setEdge(EXTERNAL_TRAFFIC_NODE, loadBalancerNodeKey);
+                    graph.setNode(loadBalancerNodeKey, {
+                        height: NODE_HEIGHT, width: NODE_WIDTH, type: NODE_TYPES.externalLoadBalancer, label: key, color: colorsBySource.get(key)});
+                    graph.setEdge(loadBalancerNodeKey, nodeKey(root), { colors: [colorsBySource.get(key)]});
+                    graph.setEdge(EXTERNAL_TRAFFIC_NODE, loadBalancerNodeKey, { colors: [colorsBySource.get(key)]});
                 });
             });
         }
-        const internalRoots = roots.filter((root) => (root.networkingInfo.ingress || []).length === 0);
+
         if (internalRoots.length > 0) {
             graph.setNode(INTERNAL_TRAFFIC_NODE, { height: NODE_HEIGHT, width: 30, type: NODE_TYPES.internalTraffic });
-            internalRoots.forEach((root) => graph.setEdge(INTERNAL_TRAFFIC_NODE, nodeKey(root)));
+            internalRoots.forEach((root) => {
+                processNode(root, root, [colorsBySource.get(nodeKey(root))]);
+                graph.setEdge(INTERNAL_TRAFFIC_NODE, nodeKey(root));
+            });
         }
     } else {
+        roots.sort(compareNodes).forEach((node) => processNode(node, node));
         graph.setNode(appNodeKey(props.app), { ...appNode, width: NODE_WIDTH, height: NODE_HEIGHT });
         roots.forEach((root) => graph.setEdge(appNodeKey(props.app), nodeKey(root)));
     }
@@ -294,9 +322,19 @@ export const ApplicationResourceTree = (props: ApplicationResourceTreeProps) => 
 
     dagre.layout(graph);
 
-    const edges: {from: string, to: string, lines: Line[]}[] = [];
+    const edges: {from: string, to: string, lines: Line[], backgroundImage?: string}[] = [];
     graph.edges().forEach((edgeInfo) => {
         const edge = graph.edge(edgeInfo);
+        const colors = edge.colors as string[] || [];
+        let backgroundImage: string;
+        if (colors.length > 0) {
+            const step = 100 / colors.length;
+            const gradient = colors.map((lineColor, i) => {
+                return `${lineColor} ${step * i}%, ${lineColor} ${step * i + step / 2}%, transparent ${step * i + step / 2}%, transparent ${step * (i + 1)}%`;
+            });
+            backgroundImage = `linear-gradient(90deg, ${gradient})`;
+        }
+
         const lines: Line[] = [];
         // don't render connections from hidden node representing internal traffic
         if (edgeInfo.v === INTERNAL_TRAFFIC_NODE || edgeInfo.w === INTERNAL_TRAFFIC_NODE) {
@@ -307,7 +345,7 @@ export const ApplicationResourceTree = (props: ApplicationResourceTreeProps) => 
                 lines.push({ x1: edge.points[i - 1].x, y1: edge.points[i - 1].y, x2: edge.points[i].x, y2: edge.points[i].y });
             }
         }
-        edges.push({ from: edgeInfo.v, to: edgeInfo.w, lines });
+        edges.push({ from: edgeInfo.v, to: edgeInfo.w, lines, backgroundImage });
     });
     const graphNodes = graph.nodes();
     const size = getGraphSize(graphNodes.map((id) => graph.node(id)));
@@ -344,7 +382,12 @@ export const ApplicationResourceTree = (props: ApplicationResourceTreeProps) => 
                     const angle = Math.atan2(line.y1 - line.y2, line.x1 - line.x2) * 180 / Math.PI;
                     return (
                         <div className='application-resource-tree__line' key={i}
-                            style={{ width: distance, left: xMid - (distance / 2), top: yMid, transform: `translate(150px, 35px) rotate(${angle}deg)`}} />
+                            style={{
+                                width: distance, left: xMid - (distance / 2),
+                                top: yMid,
+                                backgroundImage: edge.backgroundImage,
+                                transform: `translate(150px, 35px) rotate(${angle}deg)`,
+                            }} />
                     );
                 })}</div>
             ))}
